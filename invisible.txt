@@ -1,0 +1,3 @@
+http://tracker.server1.com
+http://tracker2.anotherserver.net
+

@@ -1,0 +1,364 @@
+#!/usr/bin/perl -w
+
+##############################################################################
+#
+# TorrentHacker is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# any later version.
+#
+# TorrentHacker is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with TorrentHacker. If not, see <http://www.gnu.org/licenses/>.
+#
+##############################################################################
+
+# ================================================================
+# TorrentHacker v2.5
+# -----------------
+# by kvs, kvs@rbht.pp.ru
+# ================================================================
+
+use strict;
+use Socket;
+use LWP::UserAgent;
+use HTTP::Request::Common;
+use HTTP::Cookies;
+use File::Basename;
+
+
+# ================================================================
+# Global Varzz
+# ================================================================
+
+my $version="2.5";
+
+my $pid;									# threads
+my $proto = getprotobyname('tcp');
+my $clients=0;									# No one is connected
+my $connection=0;								# Not connected to the server
+my $i=0;
+my $curdir=dirname($0);
+
+my ($port, $maxclients, $threads, $invfile, $debug, $up_mult, $down_mult, $peer_id, $change_ua);
+my ($useragent, $client_ua);
+my @trackers;
+
+# ================================================================
+# General Partzzz
+# ================================================================
+
+sub parseconfig {
+	open(CONTROL,"$curdir/config.cfg") || die "Cannot open config.cfg: $!";
+	my @control=<CONTROL>;
+	close(CONTROL);
+	foreach (@control)
+	{
+		chomp;
+		if(/^\#(.+)/){next;}						# no comprendo
+		elsif(m/PORT=/) {
+			$port=$_;
+			$port=~s/PORT=//;
+		}
+		elsif(m/DEBUG=/) {
+			$debug=$_;
+			$debug=~s/DEBUG=//;
+		}
+		elsif(m/THREADS=/) {
+			$threads=$_;
+			$threads=~s/THREADS=//;
+		}
+		elsif(m/CHANGE_AGENT=/) {
+			$change_ua=$_;
+			$change_ua=~s/CHANGE_AGENT=//;
+		}
+		elsif(m/USER_AGENT=/) {
+			$useragent=$_;
+			$useragent=~s/USER_AGENT=//;
+		}
+		elsif(/PEER_ID=/) {
+			$peer_id=$_;
+			$peer_id=~s/PEER_ID=//;
+		}
+		elsif(m/INV_FILE=/) {
+			$invfile=$_;
+			$invfile=~s/INV_FILE=//;
+		}
+		elsif(m/UPLOAD_MULTIPLIER=/) {
+			$up_mult=$_;
+			$up_mult=~s/UPLOAD_MULTIPLIER=//;
+		}
+		elsif(m/DOWNLOAD_MULTIPLIER=/) {
+			$down_mult=$_;
+			$down_mult=~s/DOWNLOAD_MULTIPLIER=//;
+		}
+	}
+}
+
+# request to torrent tracker 
+sub send_request
+{
+	my ($ua, $query) = @_;
+	
+	my $client_reply;
+	my $request = new HTTP::Request(
+	    "GET",
+	    "$query"
+	);
+
+ my @ns_headers = (
+   'User-Agent' => $ua 
+	);
+
+#$ua="Transmission/193";
+#  print STDOUT "query=$query\nuseragent=$ua\n";
+	my $agent = new LWP::UserAgent;
+	#$agent->agent( "$ua" );					# our torrent client
+
+	$agent->timeout(10);      # timeout 10 secs
+
+	#my $response = $agent->request( $request );
+	my $response = $agent->get($query, @ns_headers);
+	$client_reply="HTTP/1.0 " . $response->status_line."\n";
+
+	if(!$response->header('Content-Type'))
+	{
+		$client_reply.="Content-type: text/plain\n\n";
+	}
+	else
+	{
+		$client_reply.="Content-type: " .$response->header('Content-Type') . "\n\n";
+	}
+
+	$client_reply.=$response->content;
+
+#print STDOUT "client reply = ". $client_reply . "\n--------------\n";
+	return $client_reply;
+	undef $query, $agent, $response, $request;
+}
+
+
+sub dprint
+{
+    my ($string) = @_;
+    if($debug){print STDOUT $string;}
+    undef $string;
+}
+
+&parseconfig();	# parsing config
+
+# read file for "invisible" trackers
+open(INVISIBLES, "$invfile");
+@trackers=<INVISIBLES>;
+close(INVISIBLES);
+
+&dprint("[+] TorrentHacker $version running\n");
+
+my $servaddr = sockaddr_in($port, INADDR_ANY);						# Listen port
+
+socket SERVER, PF_INET, SOCK_STREAM, $proto
+                   or die " [-] Unable to create socket: $!";				# Create socket
+
+bind SERVER, $servaddr or die " [-] Unable to bind: $!";
+
+#my $ua = LWP::UserAgent->new(agent => $useragent);
+listen (SERVER, SOMAXCONN);
+&dprint( "[+] Listening on port $port\n");
+
+my @gotten;
+my $data;
+my %param;
+
+
+
+# Multi-threads dont fucking work right...
+for (1..$threads) {
+	unless($pid=fork()) {
+#while (accept CONNECTION, SERVER) {				# client is connected
+########################################
+#my $curthread=0;
+#while (accept CONNECTION, SERVER) {
+# accepting a connection 
+my $client_addr; 
+while ($client_addr = accept(CONNECTION, SERVER)) 
+{ 
+	#find out who connected 
+	my ($client_port, $client_ip) = sockaddr_in($client_addr); 
+	my $client_ipnum = inet_ntoa($client_ip); 
+	my $client_host = gethostbyaddr($client_ip, AF_INET); 
+	# print who has connected 
+	print STDOUT "[+] Client connected: $client_host","[$client_ipnum] \n"; 
+
+#	if($curthread < $threads) { 
+#	if($pid=fork()) {
+	#print "just chillen $pid\n";
+#		close CONNECTION;
+#		next;die;
+#	}else{
+
+        select CONNECTION;					# default print to client
+        # $| = 1;
+	my $get;
+	while (<CONNECTION>) {								# gettin data
+		# getting User-Agent of torrent client.
+		if($_ =~ m/User-Agent/) { 
+			$client_ua=$_;
+			$client_ua=~s/User-Agent: //g;
+		}
+		# print STDOUT "CLIENT SEND: $_\n";
+		push @gotten,$_;
+		if ($_ =~ /^\s*$/) { last;}
+		if(!$_){next;}
+		my ($f,$v) = split(/\s+/,$_,2);
+		$param{lc($f)} = $v;
+		undef $f;
+		undef $v;
+
+	}
+	
+	# if no data received, skipping thread
+	if(!$gotten[0]) { &dprint("[+] No data Received, skipping\n"); close CONNECTION; next; }
+
+	$get=$gotten[0];
+	$get=~s/GET //g;
+	$get=~s/ HTTP\/1.0//g;
+	$get=~s/ HTTP\/1.1//g;
+	$get=~s/ //g;
+	$get=~s/\n//g;
+	$get=~s/\r//g;
+	
+	undef @gotten;
+
+		my ($hosturl, $hostdata) = split(/\?/, $get);				# split the url
+	#print STDOUT "Hostdata = $hostdata\n";
+	my @tempdata=split(/\&/, $hostdata);
+	my %newdata;
+	my $invisible;
+	&dprint ("[*] working on $hosturl\n");
+#	if($hosturl =~ m/scrape/) { &dprint("[*] Scrape detected. Skipping.\n");close CONNECTION; next;}
+	foreach(@tempdata)
+	{
+		if(!$_){next;}
+		my ($param, $value) = split(/=/, $_);				# get all the data
+		#print STDOUT "[!!!] param=$param value=$value\n";
+		$newdata{$param} = $value;
+	}
+	undef (@tempdata);
+	undef $hostdata;
+	if(!%newdata){	&dprint("[!] No data received from torrent client, skipping.\n"); close CONNECTION; next;}
+	#$ua->timeout(10);	# timeout 10 secs
+
+	foreach my $torrent (@trackers)
+	{
+		chomp($torrent);chomp($hosturl);
+		if($hosturl =~ m/$torrent/)						# if its invisible url
+		{
+			$invisible=1;						# make it invisible
+		}
+	}		
+	undef $get;
+
+	# invisible mode
+	if($invisible)
+	{
+		&dprint("[*] Invisible on $hosturl\n");
+	#	if ($newdata{'event'} eq "")
+	#	{
+	#		$newdata{'left'}=$newdata{'left'}+$newdata{'downloaded'};
+	#		$newdata{'uploaded'}*=$up_mult;
+	#		$newdata{'downloaded'}=0;
+	#		my $query=$hosturl . "?";
+	#		foreach ( keys %newdata) {
+	#			$query.=$_ . "=" . $newdata{$_} . "\&";
+	#		}
+	 #               # Remove from stats
+	#		print &send_request($useragent, $query);
+	#	}
+	#	else
+	#	{
+			$newdata{'left'}+=$newdata{'downloaded'};
+
+			# did we download something? of course not
+			#$newdata{'uploaded'}*=$up_mult;
+			$newdata{'uploaded'}=0;
+			$newdata{'downloaded'}=0;
+			
+			# out torrent started
+			$newdata{'event'}="started";
+	
+			# in case there is a error, we have to tell the traker 
+			# that we haven't downloaded it (mostly seeding mode)
+			if(!$newdata{'left'}) { $newdata{'left'}=1; }
+			my $query=$hosturl . "?";
+			foreach ( keys %newdata) {
+				print STDOUT "[+] $_ = ".$newdata{$_}."\n";
+				$query.=$_ . "=" . $newdata{$_} . "\&";
+			    }
+
+			# Get the peers
+			if($change_ua) { print &send_request($useragent, $query); }
+                        else { print &send_request($client_ua, $query); }
+			
+#			close CONNECTION;
+			#print &send_request($useragent,$query);
+
+			# Change event-info
+			$query=~s/started/stopped/g;
+
+			# Remove from stats
+		#	&send_request($useragent,$query);
+			if($change_ua) { &send_request($useragent, $query); }
+                        else { &send_request($client_ua, $query); }
+
+			undef $query;
+	#	}
+	}
+	# normal mode
+	else
+	{
+			# make sure there is stuff to change, could be just a scrape
+			if($newdata{'downloaded'} || $newdata{'uploaded'}) {
+				&dprint("[*] faking upload traffic. before = ");  &dprint($newdata{'uploaded'});
+
+				$newdata{'uploaded'}*=$up_mult;
+				$newdata{'uploaded'}+=($newdata{'downloaded'}*($down_mult));
+				&dprint( " ... now = "); &dprint( $newdata{'uploaded'}); &dprint("\n");
+			}
+			# changing peer_id to match user-agent
+			if($newdata{'peer_id'} && $change_ua){
+				my ($junkone, $junktwo, $randomstring) = split(/-/, $newdata{'peer_id'});
+				&dprint("[*] Changing peer_id from "); &dprint($newdata{'peer_id'});
+				$newdata{'peer_id'}="-$peer_id-$randomstring";
+				&dprint(" to ... "); &dprint($newdata{'peer_id'}); &dprint("\n");
+				
+			}
+			my $query=$hosturl . "?";
+			foreach ( keys %newdata) {
+				$query.=$_ . "=" . $newdata{$_} . "\&";
+			}
+			if($change_ua) { print &send_request($useragent, $query); }
+			else { print &send_request($client_ua, $query); }
+			
+			close CONNECTION;
+		undef $query;
+
+	}
+		
+	close CONNECTION;
+
+	undef %param;
+	undef @tempdata;
+	undef %newdata;
+	#undef $get;
+	undef $hosturl;
+ 	undef $invisible;
+	#undef *gotten;
+	#$#gotten = -1;
+#exit;
+} } }
+waitpid($pid,0);
+undef $useragent;
